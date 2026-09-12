@@ -104,13 +104,18 @@ export default function HomePage() {
 
     setDownloadState({ status: "loading" });
 
-    // Use SSE for progress, then trigger actual download
+    // Generate a unique job ID for this download session.
+    // The progress route downloads the file and registers the path under this ID.
+    // The download route then streams the already-downloaded file to the browser.
+    const jobId = crypto.randomUUID();
+
+    // Use SSE for progress tracking
     abortRef.current?.abort();
     abortRef.current = new AbortController();
 
-    const progressUrl = `/api/progress?url=${encodeURIComponent(
-      videoData.webpage_url
-    )}&format=${selectedFormat}&audio=${option.isAudioOnly}`;
+    const progressUrl =
+      `/api/progress?url=${encodeURIComponent(videoData.webpage_url)}` +
+      `&format=${selectedFormat}&audio=${option.isAudioOnly}&jobId=${jobId}`;
 
     try {
       const response = await fetch(progressUrl, {
@@ -148,11 +153,9 @@ export default function HomePage() {
               }
               if (evt.done) {
                 setDownloadState({ status: "done" });
-                // Trigger browser download
+                // Trigger browser download — server streams the already-downloaded file
                 const a = document.createElement("a");
-                a.href = `/api/download?url=${encodeURIComponent(
-                  videoData.webpage_url
-                )}&format=${selectedFormat}&audio=${option.isAudioOnly}`;
+                a.href = `/api/download?jobId=${jobId}`;
                 a.click();
               } else {
                 setDownloadState({

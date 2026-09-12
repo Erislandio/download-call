@@ -1,138 +1,127 @@
 import { NextRequest } from "next/server";
-import { spawn } from "child_process";
-import os from "os";
-import path from "path";
+import { getJob, cleanupJob } from "@/lib/download-jobs";
 import fs from "fs";
-
-const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
-const FFMPEG_PATH = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
+import path from "path";
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const url = searchParams.get("url");
-  const formatId = searchParams.get("format") || "mp4-720";
-  const isAudioOnly = searchParams.get("audio") === "true";
+  const jobId = searchParams.get("jobId");
 
-  if (!url) {
-    return Response.json({ error: "URL é obrigatória" }, { status: 400 });
+  if (!jobId) {
+    return Response.json({ error: "jobId é obrigatório" }, { status: 400 });
   }
 
-  const tmpDir = os.tmpdir();
-  const tmpFile = path.join(tmpDir, `yt-${Date.now()}.%(ext)s`);
+  const job = getJob(jobId);
 
-  const args: string[] = [
-    "--no-playlist",
-    "--no-warnings",
-    "--ffmpeg-location", FFMPEG_PATH,
-    "-o", tmpFile,
-  ];
-
-  if (isAudioOnly) {
-    args.push("-x", "--audio-format", "mp3", "--audio-quality", "0");
-  } else {
-    // Derive quality height from formatId like "mp4-1080", "mp4-720", etc.
-    const height = formatId.replace("mp4-", "");
-    args.push(
-      "-f",
-      `bestvideo[height<=${height}]+bestaudio/best[height<=${height}]/best`,
-      "--merge-output-format",
-      "mp4"
+  if (!job) {
+    return Response.json(
+      { error: "Job não encontrado. O download pode ter expirado." },
+      { status: 404 }
     );
   }
 
-  args.push(url);
+  if (job.status === "error") {
+    return Response.json(
+      { error: job.error ?? "Download falhou" },
+      { status: 500 }
+    );
+  }
 
-  let resolvedPath: string | null = null;
+  if (job.status !== "done" || !job.filePath) {
+    return Response.json(
+      { error: "Download ainda em progresso. Aguarde a conclusão." },
+      { status: 202 }
+    );
+  }
 
-  return new Promise<Response>((resolve) => {
-    const proc = spawn(YTDLP_PATH, args);
+  const filePath = job.filePath;
 
-    let stderr = "";
+  if (!fs.existsSync(filePath)) {
+    return Response.json(
+      { error: "Arquivo temporário não encontrado no servidor" },
+      { status: 404 }
+    );
+  }
 
-    proc.stdout.on("data", (data: Buffer) => {
-      const line = data.toString();
-      // Extract the actual output path from yt-dlp merge messages
-      const mergeMatch = line.match(/\[Merger\] Merging formats into "(.+?)"/);
-      const destMatch = line.match(/\[download\] Destination: (.+)/);
-      if (mergeMatch) resolvedPath = mergeMatch[1];
-      else if (destMatch && !resolvedPath) resolvedPath = destMatch[1];
-    });
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const ext = path.extname(filePath).toLowerCase();
+  const filename = path.basename(filePath);
 
-    proc.stderr.on("data", (data: Buffer) => {
-      stderr += data.toString();
-    });
+  const contentType =
+    ext === ".mp3"
+      ? "audio/mpeg"
+      : ext === ".webm"
+      ? "video/webm"
+      : "video/mp4";
 
-    proc.on("close", (code) => {
-      if (code !== 0) {
-        resolve(
-          Response.json(
-            { error: `yt-dlp falhou: ${stderr.slice(0, 500)}` },
-            { status: 500 }
-          )
-        );
-        return;
-      }
+  // ── Handle HTTP Range Requests (allows download resumption) ─────────────
+  const rangeHeader = request.headers.get("range");
+  let start = 0;
+  let end = fileSize - 1;
+  let isPartial = false;
 
-      // Find the actual file (yt-dlp replaces %(ext)s)
-      const pattern = tmpFile.replace("%(ext)s", "");
-      const dir = path.dirname(pattern);
-      const base = path.basename(pattern);
+  if (rangeHeader) {
+    const match = rangeHeader.match(/bytes=(\d*)-(\d*)/);
+    if (match) {
+      start = match[1] ? parseInt(match[1], 10) : 0;
+      end = match[2] ? parseInt(match[2], 10) : fileSize - 1;
+      // Clamp to valid range
+      start = Math.max(0, Math.min(start, fileSize - 1));
+      end = Math.max(start, Math.min(end, fileSize - 1));
+      isPartial = true;
+    }
+  }
 
-      let actualFile = resolvedPath;
-      if (!actualFile || !fs.existsSync(actualFile)) {
-        // Fallback: look in tmpdir for matching file
-        const files = fs.readdirSync(dir).filter((f) => f.startsWith(base));
-        if (files.length > 0) {
-          actualFile = path.join(dir, files[0]);
+  const chunkSize = end - start + 1;
+
+  const headers: Record<string, string> = {
+    "Content-Type": contentType,
+    "Content-Disposition": `attachment; filename="${encodeURIComponent(filename)}"`,
+    "Content-Length": String(chunkSize),
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+  };
+
+  if (isPartial) {
+    headers["Content-Range"] = `bytes ${start}-${end}/${fileSize}`;
+  }
+
+  // ── Stream the file (or range) to the client ────────────────────────────
+  const fileStream = fs.createReadStream(filePath, { start, end });
+
+  // Cleanup the temp file after the stream finishes (only on full download)
+  // For range requests we keep the file until all bytes are sent or it expires.
+  const isFullDownload = !isPartial || (start === 0 && end === fileSize - 1);
+
+  const nodeStream = fileStream;
+
+  // Wrap Node.js ReadStream into a Web ReadableStream
+  const webStream = new ReadableStream({
+    start(controller) {
+      nodeStream.on("data", (chunk: Buffer | string) => {
+        controller.enqueue(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      });
+
+      nodeStream.on("end", () => {
+        controller.close();
+        if (isFullDownload) {
+          // Small delay to ensure the response is flushed before unlink
+          setTimeout(() => cleanupJob(jobId), 500);
         }
-      }
+      });
 
-      if (!actualFile || !fs.existsSync(actualFile)) {
-        resolve(
-          Response.json(
-            { error: "Arquivo baixado não encontrado" },
-            { status: 500 }
-          )
-        );
-        return;
-      }
+      nodeStream.on("error", (err) => {
+        controller.error(err);
+      });
+    },
+    cancel() {
+      nodeStream.destroy();
+    },
+  });
 
-      const fileBuffer = fs.readFileSync(actualFile);
-      const ext = path.extname(actualFile).toLowerCase();
-      const contentType =
-        ext === ".mp3"
-          ? "audio/mpeg"
-          : ext === ".webm"
-          ? "video/webm"
-          : "video/mp4";
-      const filename = path.basename(actualFile);
-
-      // Cleanup temp file
-      try {
-        fs.unlinkSync(actualFile);
-      } catch {
-        // ignore cleanup errors
-      }
-
-      resolve(
-        new Response(fileBuffer, {
-          status: 200,
-          headers: {
-            "Content-Type": contentType,
-            "Content-Disposition": `attachment; filename="${encodeURIComponent(filename)}"`,
-            "Content-Length": String(fileBuffer.length),
-          },
-        })
-      );
-    });
-
-    proc.on("error", (err) => {
-      resolve(
-        Response.json(
-          { error: `Erro ao iniciar yt-dlp: ${err.message}` },
-          { status: 500 }
-        )
-      );
-    });
+  return new Response(webStream, {
+    status: isPartial ? 206 : 200,
+    headers,
   });
 }
