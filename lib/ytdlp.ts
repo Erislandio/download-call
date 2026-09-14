@@ -1,5 +1,8 @@
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
+import { mkdtemp, readdir, readFile, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 
 const execFileAsync = promisify(execFile);
 
@@ -55,6 +58,161 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
 
   const info = JSON.parse(stdout) as VideoInfo;
   return info;
+}
+
+/** A single subtitle cue with start/end in seconds and plain text. */
+export interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** Transcript with both plain text (for display) and segments (for Gemini). */
+export interface VideoTranscript {
+  text: string;
+  segments: TranscriptSegment[];
+}
+
+/** Convert a VTT timestamp string (HH:MM:SS.mmm or MM:SS.mmm) to seconds. */
+function vttTimeToSeconds(ts: string): number {
+  const parts = ts.trim().split(":");
+  if (parts.length === 3) {
+    return (
+      parseInt(parts[0]) * 3600 +
+      parseInt(parts[1]) * 60 +
+      parseFloat(parts[2])
+    );
+  }
+  return parseInt(parts[0]) * 60 + parseFloat(parts[1]);
+}
+
+/** Parse a VTT subtitle file into cues with timestamps and clean text. */
+function parseVttWithTimestamps(vttContent: string): TranscriptSegment[] {
+  const segments: TranscriptSegment[] = [];
+  // Split on blank lines to get individual cues
+  const cues = vttContent.split(/\n\s*\n/);
+
+  for (const cue of cues) {
+    const lines = cue.split("\n").map((l) => l.trim()).filter(Boolean);
+    // Find the timing line
+    const timingIdx = lines.findIndex((l) => l.includes("-->"));
+    if (timingIdx === -1) continue;
+
+    const timing = lines[timingIdx];
+    const match = timing.match(
+      /^([\d:.,]+)\s*-->\s*([\d:.,]+)/
+    );
+    if (!match) continue;
+
+    const start = vttTimeToSeconds(match[1].replace(",", "."));
+    const end = vttTimeToSeconds(match[2].replace(",", "."));
+
+    // Text lines are everything after the timing line
+    const rawText = lines.slice(timingIdx + 1).join(" ");
+    const text = rawText
+      .replace(/<[^>]+>/g, "")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&nbsp;/g, " ")
+      .trim();
+
+    if (text) {
+      segments.push({ start, end, text });
+    }
+  }
+
+  // Deduplicate consecutive cues with identical text
+  return segments.filter(
+    (seg, i) => i === 0 || seg.text !== segments[i - 1].text
+  );
+}
+
+/** Parse a VTT subtitle file into clean plain text (no timestamps, no duplicates). */
+function parseVtt(vttContent: string): string {
+  const segments = parseVttWithTimestamps(vttContent);
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const seg of segments) {
+    if (!seen.has(seg.text)) {
+      seen.add(seg.text);
+      result.push(seg.text);
+    }
+  }
+  return result.join("\n");
+}
+
+/**
+ * Downloads subtitle/auto-caption tracks for a YouTube URL using yt-dlp,
+ * parses the VTT file, and returns { text, segments }.
+ * Returns null if no subtitles are available.
+ */
+export async function getVideoTranscript(url: string): Promise<VideoTranscript | null> {
+  const tmpDir = await mkdtemp(join(tmpdir(), "yt-transcript-"));
+
+  try {
+    // Try manual subs first, fall back to auto-generated captions
+    for (const subArgs of [
+      ["--write-subs", "--no-write-auto-subs"],
+      ["--write-auto-subs", "--no-write-subs"],
+    ]) {
+      await execFileAsync(YTDLP_PATH, [
+        "--no-playlist",
+        "--skip-download",
+        "--sub-langs", "pt-BR,pt",
+        "--convert-subs", "vtt",
+        "--ffmpeg-location", FFMPEG_PATH,
+        "-o", join(tmpDir, "%(id)s"),
+        ...subArgs,
+        url,
+      ]).catch(() => null); // ignore errors, check files below
+
+      const files = await readdir(tmpDir);
+      const vttFile = files.find((f) => f.endsWith(".vtt"));
+
+      if (vttFile) {
+        const content = await readFile(join(tmpDir, vttFile), "utf-8");
+        const segments = parseVttWithTimestamps(content);
+        const text = segments
+          .map((s) => `[${formatDuration(s.start)}] ${s.text}`)
+          .join("\n");
+        if (text) return { text, segments };
+      }
+    }
+
+    // No Portuguese subs found — try English as last resort
+    for (const subArgs of [
+      ["--write-subs", "--no-write-auto-subs"],
+      ["--write-auto-subs", "--no-write-subs"],
+    ]) {
+      await execFileAsync(YTDLP_PATH, [
+        "--no-playlist",
+        "--skip-download",
+        "--sub-langs", "en,en-US",
+        "--convert-subs", "vtt",
+        "--ffmpeg-location", FFMPEG_PATH,
+        "-o", join(tmpDir, "%(id)s"),
+        ...subArgs,
+        url,
+      ]).catch(() => null);
+
+      const files = await readdir(tmpDir);
+      const vttFile = files.find((f) => f.endsWith(".vtt"));
+
+      if (vttFile) {
+        const content = await readFile(join(tmpDir, vttFile), "utf-8");
+        const segments = parseVttWithTimestamps(content);
+        const text = segments
+          .map((s) => `[${formatDuration(s.start)}] ${s.text}`)
+          .join("\n");
+        if (text) return { text, segments };
+      }
+    }
+
+    return null;
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
+  }
 }
 
 export function buildDownloadOptions(formats: VideoFormat[]): DownloadOption[] {

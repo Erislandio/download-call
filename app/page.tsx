@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { VideoCard } from "@/components/VideoCard";
@@ -14,6 +14,11 @@ import {
   AlertCircle,
   Video,
   Sparkles,
+  FileText,
+  Copy,
+  Check,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 
 // Defined inline to avoid importing server-only lib/ytdlp in the client bundle
@@ -27,6 +32,19 @@ interface DownloadOption {
   isAudioOnly: boolean;
 }
 
+interface TranscriptSegment {
+  start: number;
+  end: number;
+  text: string;
+}
+
+interface Highlight {
+  title: string;
+  start: string;
+  end: string;
+  reason: string;
+}
+
 interface VideoData {
   id: string;
   title: string;
@@ -38,6 +56,8 @@ interface VideoData {
   upload_date: string;
   description: string;
   webpage_url: string;
+  transcript: string | null;
+  transcriptSegments: TranscriptSegment[] | null;
   downloadOptions: DownloadOption[];
 }
 
@@ -57,8 +77,21 @@ export default function HomePage() {
   const [downloadState, setDownloadState] = useState<DownloadState>({
     status: "idle",
   });
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [highlights, setHighlights] = useState<Highlight[]>([]);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+
+  // Reset transcript panel on new search
+  useEffect(() => {
+    setTranscriptOpen(false);
+    setCopied(false);
+    setHighlights([]);
+    setAnalyzeError(null);
+  }, [videoData]);
 
   const handleFetch = useCallback(async () => {
     if (!url.trim()) return;
@@ -93,6 +126,31 @@ export default function HomePage() {
       setFetching(false);
     }
   }, [url]);
+
+  const handleAnalyze = useCallback(async () => {
+    if (!videoData?.transcriptSegments?.length) return;
+    setAnalyzing(true);
+    setAnalyzeError(null);
+    setHighlights([]);
+
+    try {
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          segments: videoData.transcriptSegments,
+          title: videoData.title,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Erro ao analisar com Gemini");
+      setHighlights(data.highlights ?? []);
+    } catch (err: unknown) {
+      setAnalyzeError(err instanceof Error ? err.message : "Erro desconhecido");
+    } finally {
+      setAnalyzing(false);
+    }
+  }, [videoData]);
 
   const handleDownload = useCallback(async () => {
     if (!videoData || !selectedFormat) return;
@@ -262,6 +320,124 @@ export default function HomePage() {
               upload_date={videoData.upload_date}
               description={videoData.description}
             />
+
+            {/* Transcript Card */}
+            {videoData.transcript && (
+              <div className="rounded-2xl bg-card/60 backdrop-blur-xl border border-border/60 shadow-xl overflow-hidden">
+                <button
+                  id="transcript-toggle-btn"
+                  onClick={() => setTranscriptOpen((v) => !v)}
+                  className="w-full flex items-center justify-between px-5 py-4 hover:bg-white/5 transition-colors"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <FileText className="w-4 h-4 text-primary" />
+                    <span className="font-bold text-sm uppercase tracking-wider text-muted-foreground">
+                      Transcrição do Vídeo
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span
+                      id="copy-transcript-btn"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        navigator.clipboard.writeText(videoData.transcript!);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 2000);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.stopPropagation();
+                          navigator.clipboard.writeText(videoData.transcript!);
+                          setCopied(true);
+                          setTimeout(() => setCopied(false), 2000);
+                        }
+                      }}
+                      className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-primary/10 hover:bg-primary/20 text-primary transition-all font-medium cursor-pointer"
+                    >
+                      {copied ? (
+                        <><Check className="w-3.5 h-3.5" />Copiado!</>
+                      ) : (
+                        <><Copy className="w-3.5 h-3.5" />Copiar</>
+                      )}
+                    </span>
+                    {transcriptOpen ? (
+                      <ChevronUp className="w-4 h-4 text-muted-foreground" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                    )}
+                  </div>
+                </button>
+
+                {transcriptOpen && (
+                  <div className="px-5 pb-5 animate-in fade-in-0 slide-in-from-top-2 duration-200 space-y-4">
+                    <pre className="text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap max-h-60 overflow-y-auto rounded-xl bg-background/50 border border-border/40 p-4 font-sans">
+                      {videoData.transcript}
+                    </pre>
+
+                    {/* Gemini Analyze Button */}
+                    {videoData.transcriptSegments?.length && (
+                      <button
+                        id="analyze-btn"
+                        onClick={handleAnalyze}
+                        disabled={analyzing}
+                        className="w-full flex items-center justify-center gap-2 h-11 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-60 text-white font-bold text-sm shadow-lg shadow-violet-500/25 transition-all hover:scale-[1.01] active:scale-[0.99]"
+                      >
+                        {analyzing ? (
+                          <><Loader2 className="w-4 h-4 animate-spin" />Analisando com Gemini...</>
+                        ) : (
+                          <><Sparkles className="w-4 h-4" />Analisar Melhores Trechos com Gemini</>
+                        )}
+                      </button>
+                    )}
+
+                    {/* Analyze error */}
+                    {analyzeError && (
+                      <div className="flex items-start gap-2.5 p-3 rounded-xl bg-destructive/10 border border-destructive/20 text-destructive text-sm">
+                        <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                        <span>{analyzeError}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Gemini Highlights Panel */}
+            {highlights.length > 0 && (
+              <div className="rounded-2xl bg-card/60 backdrop-blur-xl border border-violet-500/30 shadow-xl shadow-violet-500/10 overflow-hidden animate-in fade-in-0 slide-in-from-bottom-4 duration-500">
+                <div className="px-5 py-4 border-b border-border/40 flex items-center gap-2.5">
+                  <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-violet-500/30">
+                    <Sparkles className="w-3.5 h-3.5 text-white" />
+                  </div>
+                  <span className="font-bold text-sm uppercase tracking-wider text-muted-foreground">
+                    Melhores Trechos — Análise Gemini
+                  </span>
+                </div>
+
+                <div className="p-5 space-y-3">
+                  {highlights.map((h, i) => (
+                    <div
+                      key={i}
+                      className="p-4 rounded-xl bg-background/50 border border-border/40 hover:border-violet-500/40 transition-colors space-y-2"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <p className="font-semibold text-sm text-foreground leading-tight">
+                          {h.title}
+                        </p>
+                        <span className="shrink-0 inline-flex items-center gap-1 text-xs font-mono font-bold px-2.5 py-1 rounded-lg bg-violet-500/15 text-violet-400 border border-violet-500/20">
+                          {h.start} → {h.end}
+                        </span>
+                      </div>
+                      <p className="text-xs text-muted-foreground leading-relaxed">
+                        {h.reason}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Format Selection */}
             <div className="p-5 rounded-2xl bg-card/60 backdrop-blur-xl border border-border/60 shadow-xl space-y-4">

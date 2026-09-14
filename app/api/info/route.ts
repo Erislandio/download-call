@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { getVideoInfo, buildDownloadOptions } from "@/lib/ytdlp";
+import { getVideoInfo, buildDownloadOptions, getVideoTranscript } from "@/lib/ytdlp";
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
@@ -20,7 +20,12 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const info = await getVideoInfo(url);
+    // Fetch video info and transcript in parallel
+    const [info, videoTranscript] = await Promise.all([
+      getVideoInfo(url),
+      getVideoTranscript(url).catch(() => null),
+    ]);
+
     const downloadOptions = buildDownloadOptions(info.formats || []);
 
     return Response.json({
@@ -34,6 +39,8 @@ export async function GET(request: NextRequest) {
       view_count: info.view_count,
       like_count: info.like_count,
       webpage_url: info.webpage_url,
+      transcript: videoTranscript?.text ?? null,
+      transcriptSegments: videoTranscript?.segments ?? null,
       downloadOptions,
     });
   } catch (err: unknown) {
