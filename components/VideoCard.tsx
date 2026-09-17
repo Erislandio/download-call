@@ -3,7 +3,8 @@
 import Image from "next/image";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
-import { Clock, Eye, ThumbsUp, User } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Clock, Eye, ThumbsUp, User, Download } from "lucide-react";
 import { formatDuration } from "@/lib/format-utils";
 
 interface VideoCardProps {
@@ -47,7 +48,7 @@ export function VideoCard({
   description,
 }: VideoCardProps) {
   return (
-    <Card className="overflow-hidden border-0 bg-card/60 backdrop-blur-xl shadow-2xl animate-in fade-in-0 slide-in-from-bottom-4 duration-500">
+    <Card className="group overflow-hidden border-0 bg-card/60 backdrop-blur-xl shadow-2xl animate-in fade-in-0 slide-in-from-bottom-4 duration-500">
       <div className="relative w-full aspect-video overflow-hidden">
         <Image
           src={thumbnail}
@@ -56,8 +57,35 @@ export function VideoCard({
           className="object-cover"
           unoptimized
         />
+        {/* Download thumbnail button */}
+        <div className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+          <Button
+            size="sm"
+            variant="secondary"
+            className="bg-black/60 hover:bg-black/80 text-white border-0 backdrop-blur-sm gap-2 h-8"
+            onClick={async (e) => {
+              e.preventDefault();
+              try {
+                const res = await fetch(thumbnail);
+                const blob = await res.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = `thumbnail-${title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.jpg`;
+                a.click();
+                window.URL.revokeObjectURL(url);
+              } catch (err) {
+                // Fallback to opening in new tab if CORS blocks the fetch
+                window.open(thumbnail, "_blank");
+              }
+            }}
+          >
+            <Download className="w-4 h-4" />
+            <span className="text-xs font-medium">Thumbnail</span>
+          </Button>
+        </div>
         {/* Duration badge */}
-        <div className="absolute bottom-3 right-3">
+        <div className="absolute bottom-3 right-3 z-10">
           <Badge className="bg-black/80 text-white border-0 font-mono text-sm px-2 py-0.5 backdrop-blur-sm">
             <Clock className="w-3 h-3 mr-1" />
             {formatDuration(duration)}
