@@ -8,6 +8,15 @@ const execFileAsync = promisify(execFile);
 
 const YTDLP_PATH = process.env.YTDLP_PATH || "yt-dlp";
 const FFMPEG_PATH = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
+// Browser to pull cookies from. Set to empty string to disable cookie passing.
+// Supported values: chrome, chromium, firefox, safari, edge, opera, brave
+const COOKIES_BROWSER = process.env.YTDLP_COOKIES_BROWSER ?? "chrome";
+
+/** Returns cookie args to inject into every yt-dlp invocation. */
+function cookieArgs(): string[] {
+  if (!COOKIES_BROWSER) return [];
+  return ["--cookies-from-browser", COOKIES_BROWSER];
+}
 
 export interface VideoFormat {
   format_id: string;
@@ -53,8 +62,9 @@ export async function getVideoInfo(url: string): Promise<VideoInfo> {
     "--no-playlist",
     "--ffmpeg-location",
     FFMPEG_PATH,
+    ...cookieArgs(),
     url,
-  ]);
+  ], { maxBuffer: 50 * 1024 * 1024 }); // 50 MB — yt-dlp dumps all formats in one JSON blob
 
   const info = JSON.parse(stdout) as VideoInfo;
   return info;
@@ -162,6 +172,7 @@ export async function getVideoTranscript(url: string): Promise<VideoTranscript |
         "--sub-langs", "pt-BR,pt",
         "--convert-subs", "vtt",
         "--ffmpeg-location", FFMPEG_PATH,
+        ...cookieArgs(),
         "-o", join(tmpDir, "%(id)s"),
         ...subArgs,
         url,
@@ -191,6 +202,7 @@ export async function getVideoTranscript(url: string): Promise<VideoTranscript |
         "--sub-langs", "en,en-US",
         "--convert-subs", "vtt",
         "--ffmpeg-location", FFMPEG_PATH,
+        ...cookieArgs(),
         "-o", join(tmpDir, "%(id)s"),
         ...subArgs,
         url,
@@ -270,6 +282,7 @@ export function spawnDownload(
     "--no-playlist",
     "--no-warnings",
     "--ffmpeg-location", FFMPEG_PATH,
+    ...cookieArgs(),
     "-o", outputPath,
   ];
 
